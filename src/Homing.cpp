@@ -72,8 +72,11 @@ static void enforceServoCurrentLimitPostHoming() {
     if ((uint16_t)cur != SERVO_CURRENT_LIMIT_MAX) {
       (void)hlscl.unLockEprom(id);
       (void)hlscl.writeWord(id, REG_CURRENT_LIMIT, SERVO_CURRENT_LIMIT_MAX);
-      (void)hlscl.LockEprom(id);
     }
+    // CalibrationOfs and unLockEprom both disable torque in FTServo. LockEprom
+    // only locks EEPROM; explicitly restore torque after all parameter writes.
+    (void)hlscl.LockEprom(id);
+    (void)hlscl.EnableTorque(id, 1);
   }
 }
 static void set_servo_limits(uint8_t servoID, uint16_t minLim, uint16_t maxLim) {
@@ -217,7 +220,6 @@ static void zero_fingers_parallel_with_current(uint8_t firstIdx, uint8_t count, 
 
 void zero_all_motors() {
   resetSdToBaseline();
-  if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
   zero_with_current(0,  sd[0].servo_direction, 950);   // Thumb Abduction
   zero_with_current(1,  sd[1].servo_direction, 950);   // Thumb Flex
   zero_with_current(2,  sd[2].servo_direction, 950);   // Thumb Tendon
@@ -236,13 +238,13 @@ void zero_all_motors() {
   hlscl.WritePosEx(SERVO_IDS[4], sd[4].extend_count, 2400, 0, 1023);   // Middle to extend
   hlscl.WritePosEx(SERVO_IDS[5], sd[5].extend_count, 2400, 0, 1023);   // Ring to extend
   hlscl.WritePosEx(SERVO_IDS[6], sd[6].extend_count, 2400, 0, 1023);   // Pinky to extend
-  
-  if (gBusMux) xSemaphoreGive(gBusMux);
 }
 
 void HOMING_start() {
   s_busy = true;
+  if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
   zero_all_motors();
   enforceServoCurrentLimitPostHoming();
+  if (gBusMux) xSemaphoreGive(gBusMux);
   s_busy = false;
 }

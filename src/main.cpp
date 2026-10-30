@@ -8,6 +8,7 @@
 #include <Preferences.h>
 #include "HandConfig.h"
 #include "Homing.h"
+#include "HostProtocol.h"
 #include "esp_system.h"
 
 HLSCL hlscl;
@@ -24,19 +25,8 @@ ServoData sd[7];
 
 static inline void sendAckFrame(uint8_t header, const uint8_t* payload, size_t n);
 
-// ---- Constants for Control Code byte ----
-static const uint8_t HOMING        = 0x01;
-static const uint8_t SET_ID         = 0x02;
-static const uint8_t TRIM           = 0x03;
-static const uint8_t CALIBRATE_MID  = 0x04;
-static const uint8_t CTRL_POS       = 0x11;
-static const uint8_t CTRL_TOR  = 0x12;
-static const uint8_t GET_POS   = 0x22;
-static const uint8_t GET_VEL   = 0x23;
-static const uint8_t GET_CURR  = 0x24;
-static const uint8_t GET_TEMP  = 0x25;
-static const uint8_t SET_SPE   = 0x31;
-static const uint8_t SET_TOR   = 0x32;
+using namespace HostProtocol;
+static FrameParser gHostParser;
 
 // ---- Defaults for SyncWritePosEx ----
 static uint16_t g_speed[7]  = {32766,32766,32766,32766,32766,32766,32766};
@@ -529,15 +519,9 @@ static bool handleSetTorCmd(const uint8_t* payload)
 }
 
 // ----- Returns true if a valid 16-byte frame was consumed and handled -----
-static bool handleHostFrame(uint8_t op) {
-  // Wait until full frame is buffered: filler + 14 payload
-  while (Serial.available() < 15) { /* wait */ }
-  uint8_t buf[15];
-  for (int i = 0; i < 15; ++i) {
-    int ch = Serial.read(); if (ch < 0) return false;
-    buf[i] = (uint8_t)ch;
-  }
-  const uint8_t* payload = &buf[1]; // buf[0] = filler 0x00 (ignored)
+static bool handleHostFrame(const uint8_t frame[FRAME_SIZE]) {
+  const uint8_t op = frame[0];
+  const uint8_t* payload = frame + 2;
 
   switch (op) {
     case CTRL_POS: {
@@ -619,7 +603,11 @@ static bool handleHostFrame(uint8_t op) {
 
     case HOMING: {
       HOMING_start();   // blocks
+      g_currentMode = MODE_POS;  // Homing sets every servo to position mode.
       saveExtendsToNVS();
+      // Commands queued during homing refer to an obsolete hand state.
+      while (Serial.available()) Serial.read();
+      gHostParser.reset();
       sendAckFrame(HOMING, nullptr, 0);
       return true;
     }
@@ -657,13 +645,13 @@ static bool handleHostFrame(uint8_t op) {
     }
 
     default:
-      //Unknown Control Code — consume frame to preserve alignment
-      return true;
+      return false;
   }
 }
 
 void setup() {
-  // USB debug
+  // USB carries binary protocol frames only. Startup text can be echoed back
+  // by the host tty before it has been configured by the SDK.
   Serial.begin(921600);
   delay(100);
 
@@ -675,11 +663,11 @@ void setup() {
   prefs.begin("hand", false);
   loadManualExtendsFromNVS();
   #if defined(LEFT_HAND)
-    Serial.println("[BOOT] Hand Type: LEFT_HAND");
+    log_i("[BOOT] Hand Type: LEFT_HAND");
   #elif defined(RIGHT_HAND)
-    Serial.println("[BOOT] Hand Type: RIGHT_HAND");
+    log_i("[BOOT] Hand Type: RIGHT_HAND");
   #else
-    Serial.println("[BOOT] Hand Type: UNKNOWN");
+    log_i("[BOOT] Hand Type: UNKNOWN");
   #endif
 
   esp_reset_reason_t reason = esp_reset_reason();
@@ -691,11 +679,11 @@ void setup() {
     do_homing = true;   // Power-dipped but not fully to 0v , Optional but recommended for safety
   }
   if (do_homing) {
-    Serial.println("[BOOT] Power-on detected → homing");
+    log_i("[BOOT] Power-on detected -> homing");
     HOMING_start();
     saveExtendsToNVS();
   } else {
-    Serial.println("[BOOT] Non-power reset → skipping homing");
+    log_i("[BOOT] Non-power reset -> skipping homing");
   }
 
   //Syncreadbegin to Start the syncread
@@ -705,14 +693,17 @@ void setup() {
   gBusMux =xSemaphoreCreateMutex();
   gMetricsMux = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(TaskSyncRead_Core1, "SyncRead", 4096, NULL, 1, NULL, 1); // run on Core1
+
+  // Ignore boot-time tty probes and input buffered while automatic homing ran.
+  while (Serial.available()) Serial.read();
+  gHostParser.reset();
 }
 
 void loop() {
-  static uint32_t last_cmd_ms = 0; 
-
   // Gate all host input during homing
   if (HOMING_isBusy()) {
     while (Serial.available()) { Serial.read(); }
+    gHostParser.reset();
     vTaskDelay(pdMS_TO_TICKS(5));
     return;
   }
@@ -720,14 +711,15 @@ void loop() {
   // ------ Soft Limit Check -------
   checkAndEnforceSoftLimits();
 
-  // Process exactly one complete 16-byte frame when available
-  if (Serial.available() >= 16) {
-    int op = Serial.read();
-    if (op >= 0) {
-      if (handleHostFrame((uint8_t)op)) {
-        last_cmd_ms = millis();
-        return;
-      }
+  // Consume noise one byte at a time until a valid header is found. A partial
+  // frame never blocks the loop and cannot permanently shift later commands.
+  uint8_t frame[FRAME_SIZE];
+  while (Serial.available()) {
+    int byte = Serial.read();
+    if (byte < 0) break;
+    if (gHostParser.push((uint8_t)byte, millis(), frame)) {
+      handleHostFrame(frame);
+      return;
     }
   }
 }
